@@ -108,6 +108,7 @@ Project/
   RSA-style batch `modexp_demo.cu`, Fermat modular inverse. **GPU: 277× speedup, 0 mismatches.**
 - [x] **Phase 5 — Analysis & writeup:** §9 filled with real T4 numbers; performance/security
   trade-off analysis complete. **PROJECT COMPLETE.**
+- [x] **Deliverables:** `report/report.tex` (5-page IEEE format), `slides/slides.tex` (Beamer, 4 slides, 2.5-min), git history committed.
 
 ---
 
