@@ -1,0 +1,221 @@
+\documentclass[aspectratio=169,10pt]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+
+\lstset{
+  basicstyle=\ttfamily\tiny,
+  language=C++,
+  breaklines=true,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+}
+
+\definecolor{gpugreen}{RGB}{0,140,70}
+\definecolor{cpured}{RGB}{180,30,30}
+
+\title[GPU Barrett Modular Arithmetic]{GPU-Accelerated Modular Arithmetic Unit\\with Barrett Reduction}
+\subtitle{ECE 268 Final Project}
+\author{Akhil Teja Chirra}
+\institute{UC San Diego}
+\date{June 4, 2026}
+
+% ---------------------------------------------------------------------------
+\begin{document}
+
+\begin{frame}
+  \titlepage
+  \begin{center}
+    \small\texttt{https://github.com/achirra-cypher/ece268-gpu-modarith}
+  \end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{The Problem: Modular Reduction is the GPU Bottleneck}
+
+\begin{columns}
+\begin{column}{0.5\textwidth}
+  \textbf{Cryptographic ops need modular reduction:}
+  \begin{itemize}
+    \item NTT (lattice PQC: Kyber, Dilithium)
+    \item RSA / Diffie-Hellman (modexp)
+    \item ZK-proof field arithmetic (Plonky2)
+  \end{itemize}
+  \vspace{0.5em}
+  \textbf{Naive $x \bmod p$ requires division}\\
+  $\rightarrow$ 20--40 cycles on CPU, \textbf{expensive on GPU}
+
+  \vspace{1em}
+  \textbf{Barrett reduction} replaces division with\\
+  precomputed multiply-shift:
+  \[
+    \mu = \left\lfloor \frac{2^{64}}{p} \right\rfloor \quad \text{(once, offline)}
+  \]
+  \[
+    q = \mathrm{hi64}(x \cdot \mu), \quad r = x - q \cdot p
+  \]
+  \[
+    \text{if } r \ge p,\; r \leftarrow r - p
+  \]
+\end{column}
+\begin{column}{0.48\textwidth}
+  \begin{block}{Why GPU?}
+    \begin{itemize}
+      \item Millions of \textbf{independent} modmul / NTT butterflies
+      \item Barrett's $\mu$ is a \textbf{shared constant} $\rightarrow$ broadcast-friendly
+      \item \texttt{\_\_umul64hi} maps to single hardware instruction on T4
+    \end{itemize}
+  \end{block}
+  \vspace{0.4em}
+  \begin{block}{Two prime fields}
+    \begin{itemize}
+      \item $p_{32} = 998244353$ (30-bit, NTT-friendly)
+      \item $p_{64} = 2^{64}{-}2^{32}{+}1$ (Goldilocks, 64-bit, used in Plonky2)
+    \end{itemize}
+  \end{block}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Architecture: Pure CUDA Modular Arithmetic Unit}
+
+\begin{columns}
+\begin{column}{0.52\textwidth}
+  \textbf{Core header: \texttt{modarith.cuh}}\\
+  \texttt{\_\_host\_\_ \_\_device\_\_} $\Rightarrow$ same code on GPU \emph{and} CPU\\[0.4em]
+
+  \begin{itemize}
+    \item \texttt{barrett32\_reduce(x, b)} — divide-free reduction
+    \item \texttt{mulmod32(a, b, p)} — modular multiply
+    \item \texttt{powmod32(a, e, p)} — square-and-multiply
+    \item \texttt{invmod32(a, p)} — Fermat: $a^{p-2} \bmod p$
+    \item Bonus: \texttt{Barrett64} for the Goldilocks prime
+  \end{itemize}
+
+  \vspace{0.6em}
+  \textbf{Application: NTT (radix-2 Cooley-Tukey)}\\
+  One CUDA kernel per butterfly stage $\Rightarrow$ \textbf{$\log_2 n$ launches}\\
+  $n/2$ independent butterflies per stage:
+  \[
+    (u, v) \leftarrow (a_i + w \cdot a_{i+\frac{n}{2}},\; a_i - w \cdot a_{i+\frac{n}{2}}) \bmod p
+  \]
+\end{column}
+\begin{column}{0.45\textwidth}
+  \begin{block}{Validation: 3-layer correctness}
+    \begin{enumerate}
+      \item \textbf{C++ oracle}: 2M random Barrett checks vs \texttt{\_\_uint128\_t \% p} — 0 failures
+      \item \textbf{Python/sympy oracle}: independent prime + NTT verification
+      \item \textbf{GPU$\equiv$CPU}: NTT elementwise for $n{=}2^4$--$2^{20}$; modexp for 1M ops — \textbf{0 mismatches}
+    \end{enumerate}
+  \end{block}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Results: GPU vs.\ CPU on Tesla T4}
+
+\begin{columns}
+\begin{column}{0.48\textwidth}
+  \begin{block}{\textcolor{gpugreen}{Barrett modmul throughput} ($n = 4$M, 64 iters)}
+    \centering
+    \begin{tabular}{lrr}
+      \toprule
+       & Throughput & Time \\
+      \midrule
+      CPU & 0.23\,Gops/s & 1161\,ms \\
+      \textbf{GPU T4} & \textbf{131.4\,Gops/s} & \textbf{2.0\,ms} \\
+      \bottomrule
+    \end{tabular}\\[0.3em]
+    {\Large \textbf{\textcolor{gpugreen}{569$\times$ speedup}}}
+  \end{block}
+  \vspace{0.3em}
+  \begin{block}{\textcolor{gpugreen}{Batched modexp ($p_{64}$, $n = 1$M)}}
+    \centering
+    GPU: 3.4\,ms $\quad$ CPU: 955.8\,ms\\[0.2em]
+    {\Large \textbf{\textcolor{gpugreen}{277$\times$ speedup}, 0 mismatches}}
+  \end{block}
+\end{column}
+\begin{column}{0.50\textwidth}
+  \begin{block}{NTT kernel speedup vs.\ transform size}
+    \centering
+    \begin{tabular}{rrrr}
+      \toprule
+      $n$ & GPU & CPU & Speedup \\
+      \midrule
+      $2^{10}$ & 0.051\,ms & 0.046\,ms & \textcolor{cpured}{0.9$\times$} \\
+      $2^{14}$ & 0.079\,ms & 0.87\,ms  & 11$\times$ \\
+      $2^{18}$ & 0.367\,ms & 19.0\,ms  & \textbf{52$\times$} \\
+      $2^{22}$ & 12.7\,ms  & 507\,ms   & 40$\times$ \\
+      \bottomrule
+    \end{tabular}
+    \vspace{0.3em}
+
+    \small \textcolor{cpured}{$\bullet$ GPU slower below $n \approx 2^{11}$}\\
+    (kernel launch + PCIe overhead dominates)\\
+    \small \textbf{$\bullet$ Peak 52$\times$ at $n=2^{18}$ (fits in L2)}\\
+    \small $\bullet$ Bandwidth-limited beyond $2^{18}$
+  \end{block}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Trade-offs: Performance vs.\ Security}
+
+\begin{columns}
+\begin{column}{0.48\textwidth}
+  \textbf{Speed gains come with caveats:}\\[0.6em]
+  \begin{enumerate}
+    \item \textbf{Timing side channels}\\
+          \texttt{if (e \& 1)} in modexp branches on secret bits\\
+          $\Rightarrow$ Montgomery ladder needed for constant-time
+    \vspace{0.4em}
+    \item \textbf{Field size vs.\ throughput}\\
+          30-bit ($p_{32}$): 569$\times$ speedup\\
+          64-bit ($p_{64}$): 277$\times$ speedup\\
+          2048-bit RSA: multi-limb, much lower
+    \vspace{0.4em}
+    \item \textbf{GPU requires batch parallelism}\\
+          $10^6$ independent ops $\rightarrow$ ideal\\
+          1 sequential modexp $\rightarrow$ no benefit
+    \vspace{0.4em}
+    \item \textbf{NTT breakeven at $n \approx 2^{11}$}\\
+          Small polynomial rings (Kyber $n{=}256$) need batched multi-NTT per launch
+  \end{enumerate}
+\end{column}
+\begin{column}{0.48\textwidth}
+  \begin{block}{Barrett vs.\ Montgomery for NTT}
+    \begin{tabular}{lcc}
+      \toprule
+       & Barrett & Montgomery \\
+      \midrule
+      Domain conversion & \textbf{None} & In + Out \\
+      Mults per reduce & 2 & 1--2 \\
+      GPU intrinsic & \texttt{\_\_umul64hi} & Same \\
+      NTT data form & \textbf{Natural} & Transformed \\
+      \bottomrule
+    \end{tabular}\\[0.4em]
+    \small Barrett avoids extra bandwidth passes — better for memory-bound NTT.
+  \end{block}
+  \vspace{0.4em}
+  \begin{alertblock}{Key takeaway}
+    GPU + Barrett: massive throughput for \textbf{batch-parallel} crypto. Side-channel safety
+    and large-field precision remain engineering challenges.
+  \end{alertblock}
+\end{column}
+\end{columns}
+
+\end{frame}
+
+\end{document}

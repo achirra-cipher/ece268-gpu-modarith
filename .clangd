@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -I cuda/include
+    - -std=c++17
+    - -x
+    - c++

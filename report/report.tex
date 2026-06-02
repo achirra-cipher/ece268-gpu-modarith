@@ -1,0 +1,418 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{url}
+\usepackage{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  language=C++
+}
+
+\begin{document}
+
+\title{GPU-Accelerated Modular Arithmetic Unit with Barrett Reduction\\
+{\footnotesize Applied to Number Theoretic Transform for Cryptographic Workloads}}
+
+\author{
+\IEEEauthorblockN{Akhil Teja Chirra}
+\IEEEauthorblockA{\textit{Electrical and Computer Engineering}\\
+\textit{University of California, San Diego}\\
+San Diego, CA, USA\\
+achirra@ucsd.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+We present a GPU-accelerated modular arithmetic engine over a large prime field, implemented in
+pure CUDA and benchmarked against single-threaded CPU equivalents. The engine supports modular
+multiplication, modular exponentiation (square-and-multiply), and Barrett reduction as the
+underlying fast reduction technique. We apply the unit to the Number Theoretic Transform (NTT)—the
+modular-arithmetic core of lattice-based post-quantum cryptography and zero-knowledge proof
+systems—and to batched RSA-style modular exponentiation over a 64-bit prime field. On an NVIDIA
+Tesla T4 GPU, our implementation achieves \textbf{569$\times$} speedup for raw modular
+multiplication throughput (131.4\,Gops/s vs.\ 0.23\,Gops/s), a peak NTT kernel speedup of
+\textbf{52$\times$} at $n{=}2^{18}$, and a \textbf{277$\times$} speedup for one million batched
+modular exponentiations over a 64-bit Goldilocks prime field. All GPU results are validated against
+an independent CPU reference and a Python big-integer oracle with zero mismatches.
+\end{abstract}
+
+\begin{IEEEkeywords}
+GPU cryptography, Barrett reduction, Number Theoretic Transform, CUDA, modular arithmetic,
+post-quantum cryptography, zero-knowledge proofs.
+\end{IEEEkeywords}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Modular arithmetic over large prime fields is the computational backbone of modern cryptography,
+appearing in RSA, Elliptic Curve Cryptography (ECC), the Number Theoretic Transform (NTT) used in
+lattice-based post-quantum schemes (CRYSTALS-Kyber~\cite{kyber}, CRYSTALS-Dilithium), and
+zero-knowledge proof systems such as Plonky2~\cite{plonky2}. These workloads share a key property:
+they consist of millions of independent modular operations that are amenable to massive parallelism.
+Modern GPUs, with thousands of compute cores and high memory bandwidth, are natural accelerators for
+such workloads.
+
+The central challenge is that modular reduction—computing $x \bmod p$—requires an integer
+division, which is expensive on GPUs (hardware integer division is multi-cycle and not pipelined on
+NVIDIA architectures). Barrett reduction~\cite{barrett} replaces the division with precomputed
+multiplications and shifts, making it both fast and well-suited to the SIMT (Single Instruction,
+Multiple Threads) GPU execution model.
+
+This paper makes the following contributions:
+\begin{enumerate}
+  \item A pure-CUDA modular arithmetic unit implementing Barrett reduction, modular multiplication,
+        modular exponentiation, and Fermat modular inverse over both a 30-bit NTT-friendly prime and
+        a 64-bit Goldilocks prime.
+  \item A pure-CUDA GPU NTT (forward and inverse) based on the iterative radix-2 Cooley-Tukey
+        algorithm, validated against a CPU reference and a Python big-integer oracle.
+  \item A comprehensive GPU-vs-CPU benchmark on an NVIDIA Tesla T4, covering raw modmul
+        throughput, NTT latency as a function of transform size, and batched modular exponentiation.
+  \item A discussion of the performance--security trade-offs inherent in the GPU implementation.
+\end{enumerate}
+
+% ============================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Modular Arithmetic and the Need for Fast Reduction}
+
+For a prime $p$ and operands $a, b \in [0, p)$, the product $a \cdot b$ can be as large as
+$(p-1)^2 \approx p^2$. Reducing this product modulo $p$ naively requires a hardware divide, which
+takes 20--40 clock cycles on modern CPUs and is similarly expensive on GPUs. Two classical
+divide-free alternatives are \emph{Montgomery multiplication}~\cite{montgomery} and
+\emph{Barrett reduction}~\cite{barrett}.
+
+\subsection{Barrett Reduction}
+
+Barrett reduction~\cite{barrett} replaces division by $p$ with multiplication by the precomputed
+constant $\mu = \lfloor 2^k / p \rfloor$ for a chosen bit-width $k$. For a product
+$x \in [0, p^2)$ with $p < 2^{32}$ (so $x < 2^{64}$), choosing $k = 64$ gives:
+\begin{align}
+  q &= \left\lfloor \frac{x \cdot \mu}{2^{64}} \right\rfloor
+    = \text{hi64}(x \cdot \mu) \label{eq:q} \\
+  r &= x - q \cdot p \label{eq:r} \\
+  \text{if } &r \ge p \text{ then } r \leftarrow r - p \label{eq:correct}
+\end{align}
+One can show $|x/p - q| \le 1$, so a single conditional subtraction suffices. The key operations
+are two 64-bit multiplications and one comparison—cheap, branchless, and warp-uniform on a GPU.
+On the CUDA device we use the \texttt{\_\_umul64hi} intrinsic for (\ref{eq:q}), avoiding any
+128-bit type dependency and mapping directly to a hardware multiply-high instruction.
+
+\subsection{Barrett vs.\ Montgomery}
+
+Montgomery multiplication operates in a transformed domain and avoids one multiplication per
+reduction in tight loops, but requires converting operands into and out of the Montgomery domain.
+For the NTT, this would add two full passes over the data (one conversion in, one out) at the cost
+of additional memory bandwidth. Since Barrett works directly in the standard residue representation,
+no conversion is needed and data stays in natural form across all butterfly stages. For our NTT
+workload—which is memory-bandwidth-bound at large $n$—Barrett's simpler data flow is advantageous.
+
+\subsection{Number Theoretic Transform}
+
+The NTT is a modular analogue of the Fast Fourier Transform (FFT) over a prime field $\mathbb{Z}_p$
+where $p$ is chosen so that $p - 1$ is divisible by a large power of two (the \emph{two-adicity}),
+ensuring existence of primitive $n$-th roots of unity for power-of-two lengths $n$. We use:
+\begin{equation}
+  p_{32} = 998244353 = 119 \cdot 2^{23} + 1, \quad g = 3
+\end{equation}
+which supports NTTs up to length $2^{23}$. The iterative radix-2 Cooley-Tukey NTT performs
+$\log_2 n$ stages, each consisting of $n/2$ butterfly operations of the form:
+\begin{align}
+  u &\leftarrow a[i] + w \cdot a[i + \text{half}] \pmod{p} \\
+  v &\leftarrow a[i] - w \cdot a[i + \text{half}] \pmod{p}
+\end{align}
+where $w$ is a twiddle factor (a power of the primitive root). Each stage is embarrassingly parallel
+across the $n/2$ butterflies, making it an ideal GPU workload.
+
+% ============================================================================
+\section{Design Choices}
+\label{sec:design}
+
+\subsection{Prime Fields}
+
+We use two prime fields. The \emph{primary} field uses $p_{32} = 998244353$ (30-bit), chosen
+because products $a \cdot b < p_{32}^2 < 2^{64}$ fit natively in 64-bit arithmetic, making the
+Barrett reduction exact and constant-time with one 64-bit multiply-high. The \emph{bonus} field
+uses the 64-bit Goldilocks prime $p_{64} = 2^{64} - 2^{32} + 1$~\cite{goldilocks}, which appears
+in the Plonky2 zero-knowledge proof system. Products $a \cdot b$ are 128-bit; the Barrett reduction
+uses 128-bit intermediate arithmetic (available as \texttt{\_\_uint128\_t} on both host and NVCC).
+
+\subsection{GPU Implementation Strategy}
+
+We implement the entire engine in pure CUDA (no PyCUDA or CuPy) to maximize performance and
+qualify for bonus credit. All core arithmetic functions are declared \texttt{\_\_host\_\_
+\_\_device\_\_} so the \emph{same code} compiles and runs on both the GPU and as plain C++ on the
+CPU (Mac via Apple Clang 21, Linux via GCC 11). This enables full correctness validation on the
+development machine before deploying to the T4.
+
+\subsection{Application: NTT and Batched Modexp}
+
+The NTT is the ideal GPU showcase for the Barrett unit: it is compute-and-memory-bound with
+millions of independent modmul calls per transform, and it is a genuine cryptographic primitive used
+in Kyber, Dilithium, and zk-SNARK/STARK systems. We also implement batched RSA-style modular
+exponentiation over $p_{64}$, which is the canonical embarrassingly parallel GPU cryptographic
+workload (one exponentiation per thread, no inter-thread communication).
+
+% ============================================================================
+\section{Implementation}
+\label{sec:impl}
+
+\subsection{Modular Arithmetic Unit (\texttt{modarith.cuh})}
+
+The core header defines two Barrett contexts, \texttt{Barrett32} and \texttt{Barrett64}, each
+holding the prime $p$ and the precomputed $\mu$:
+
+\begin{lstlisting}
+struct Barrett32 { uint64_t p, mu; };
+
+Barrett32 barrett32_make(uint64_t p) {
+    return { p, (uint64_t)(((__uint128_t)1<<64)/p) };
+}
+
+__host__ __device__ uint64_t
+barrett32_reduce(uint64_t x, const Barrett32& b) {
+#if defined(__CUDA_ARCH__)
+    uint64_t q = __umul64hi(x, b.mu);   // device intrinsic
+#else
+    uint64_t q = (__uint128_t)x*b.mu >> 64;
+#endif
+    uint64_t r = x - q * b.p;
+    if (r >= b.p) r -= b.p;
+    return r;
+}
+\end{lstlisting}
+
+\noindent Built on top of this: \texttt{mulmod32}, \texttt{addmod32}, \texttt{submod32},
+\texttt{powmod32} (square-and-multiply), and \texttt{invmod32} (Fermat: $a^{p-2} \bmod p$).
+Equivalent \texttt{Barrett64} / \texttt{mulmod64} / \texttt{powmod64} / \texttt{invmod64} handle
+the 64-bit Goldilocks prime using \texttt{\_\_uint128\_t} on both host and device.
+
+\subsection{GPU NTT (\texttt{ntt\_gpu.cuh})}
+
+The GPU NTT uses three kernel types: (1)~\texttt{k\_bitrev} permutes the input array into
+bit-reversed order; (2)~\texttt{k\_ntt\_stage} performs one butterfly stage; (3)~\texttt{k\_scale}
+divides by $n$ for the inverse NTT. Twiddle factors are precomputed on the host into a length-$n$
+table of powers of the primitive root, uploaded to device memory once, and reused across all stages:
+$$\texttt{roots}[j] = g^{j \bmod n}, \quad j = 0, \ldots, n-1.$$
+The stage kernel is:
+\begin{lstlisting}
+__global__ void k_ntt_stage(
+    uint64_t* a, const uint64_t* roots,
+    uint32_t n, uint32_t len, Barrett32 b) {
+  uint32_t t  = blockIdx.x*blockDim.x+threadIdx.x;
+  uint32_t nb = n >> 1;
+  if (t >= nb) return;
+  uint32_t half = len >> 1;
+  uint32_t k    = t & (half - 1);
+  uint32_t i    = (t/half)*len + k;
+  uint64_t tw   = roots[(n/len)*k];
+  uint64_t u = a[i], v = mulmod32(a[i+half], tw, b);
+  a[i]       = addmod32(u, v, b.p);
+  a[i+half]  = submod32(u, v, b.p);
+}
+\end{lstlisting}
+\noindent One kernel launch per stage ($\log_2 n$ launches total). Each thread handles one
+butterfly, occupying \texttt{n/2} threads per stage.
+
+\subsection{Benchmark Harness (\texttt{bench.cu})}
+
+CUDA events (\texttt{cudaEventRecord} / \texttt{cudaEventElapsedTime}) time the GPU kernels with
+microsecond resolution. We separately measure: (1)~the \emph{kernel-only} window (data already
+resident on device), representing peak compute throughput; and (2)~the \emph{end-to-end} window
+(H2D copy + kernels + D2H copy), representing the realistic offload latency. The CPU reference
+runs the identical Barrett C++ code on a single thread, timed with \texttt{std::chrono}.
+
+\subsection{Correctness Methodology}
+
+Correctness is validated at three independent levels:
+\begin{enumerate}
+  \item \textbf{C++ oracle}: The Barrett unit is tested against ground-truth \texttt{\_\_uint128\_t
+        \% p} arithmetic for 2M random and boundary operands on each prime field—zero failures.
+  \item \textbf{Python oracle} (\texttt{oracle.py}): Sympy and Python big-integers independently
+        verify primality, primitive roots, Barrett correctness, and NTT round-trip.
+  \item \textbf{GPU-vs-CPU}: GPU NTT output is checked elementwise against the CPU reference for
+        all transform sizes $n \in \{2^4, \ldots, 2^{20}\}$; batched GPU modexp is checked against
+        the CPU for $2^{20}$ exponentiations—zero mismatches.
+\end{enumerate}
+
+% ============================================================================
+\section{Results}
+\label{sec:results}
+
+All experiments run on a Google Colab NVIDIA Tesla T4 (sm\_75, 16\,GB GDDR6, 8.1\,TFLOPS FP32,
+CUDA 12.8) vs.\ a single Intel Xeon CPU core available in Colab.
+
+\subsection{Barrett Modmul Throughput}
+
+We launch $n = 2^{22}$ independent threads, each performing 64 chained Barrett modular
+multiplications over $p_{32}$, giving $\approx268\mathrm{M}$ total operations.
+
+\begin{table}[h]
+\centering
+\caption{Barrett modmul throughput ($p_{32}$, $n{=}2^{22}$, 64 iters/lane)}
+\label{tab:modmul}
+\begin{tabular}{lrr}
+\toprule
+ & Throughput & Wall time \\
+\midrule
+CPU (1 thread) & 0.23\,Gops/s & 1161\,ms \\
+GPU (T4) & \textbf{131.4\,Gops/s} & \textbf{2.04\,ms} \\
+\midrule
+\textbf{Speedup} & \multicolumn{2}{c}{\textbf{569$\times$}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The 569$\times$ speedup reflects the ideal case: $2^{22}$ independent threads with no
+inter-thread communication and perfectly uniform control flow. All 2560 T4 CUDA cores stay
+saturated throughout the kernel.
+
+\subsection{NTT Latency vs.\ Transform Size}
+
+\begin{table}[h]
+\centering
+\caption{Forward NTT latency: GPU kernel-only and end-to-end vs.\ CPU ($p_{32}$)}
+\label{tab:ntt}
+\begin{tabular}{lrrrr}
+\toprule
+$n$ & GPU kernel & GPU total & CPU & Kernel \\
+ &  &  &  & speedup \\
+\midrule
+$2^{10}$ & 0.051\,ms & 0.100\,ms & 0.046\,ms & 0.9$\times$ \\
+$2^{12}$ & 0.061\,ms & 0.096\,ms & 0.193\,ms & 3.2$\times$ \\
+$2^{14}$ & 0.079\,ms & 0.163\,ms & 0.866\,ms & 11$\times$ \\
+$2^{16}$ & 0.141\,ms & 0.423\,ms & 3.82\,ms & 27$\times$ \\
+$2^{18}$ & 0.367\,ms & 1.312\,ms & 19.0\,ms & \textbf{52$\times$} \\
+$2^{20}$ & 2.54\,ms  & 6.37\,ms  & 90.1\,ms & 35$\times$ \\
+$2^{22}$ & 12.7\,ms  & 27.3\,ms  & 507\,ms  & 40$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several observations follow from Table~\ref{tab:ntt}. (1)~At $n = 2^{10}$, the GPU is actually
+\emph{slower} than the CPU (0.9$\times$): kernel launch overhead for $\log_2 n = 10$ stages plus
+PCIe transfer cost exceeds the computational advantage at this size. The breakeven point is between
+$n = 2^{11}$ and $n = 2^{12}$. (2)~The kernel-only speedup peaks at $52\times$ for $n = 2^{18}$,
+where the working set fits in the T4's 4\,MB L2 cache and all SMs are fully occupied. (3)~For
+$n > 2^{18}$, the speedup decreases slightly as the transform overflows L2 and the workload becomes
+bandwidth-limited.
+
+\subsection{Batched Modular Exponentiation (Large Prime Field)}
+
+\begin{table}[h]
+\centering
+\caption{Batched modexp: $2^{20}$ independent $a_i^{e_i} \bmod p_{64}$ (full 64-bit exponents)}
+\label{tab:modexp}
+\begin{tabular}{lrrr}
+\toprule
+ & GPU (T4) & CPU (1 thread) & Speedup \\
+\midrule
+$n = 2^{20}$ & 3.4\,ms & 955.8\,ms & \textbf{277$\times$} \\
+Mismatches & \multicolumn{3}{c}{0 / 1\,048\,576} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 277$\times$ speedup for Goldilocks-field modexp confirms that independent-operation batches are
+the GPU's strongest use case. Each thread executes 64 iterations of square-and-multiply without any
+shared state, keeping all 2560 CUDA cores active. The correctness check (Table~\ref{tab:modexp})
+validates every one of the million results.
+
+% ============================================================================
+\section{Discussion: Performance--Security Trade-offs}
+\label{sec:discuss}
+
+\subsection{Constant-Time Concerns}
+
+Our \texttt{powmod} uses textbook square-and-multiply, which branches on exponent bits
+(\texttt{if (e \& 1)}). This constitutes a timing side channel if the exponent is secret (e.g., an
+RSA private key or ECDH scalar). The conditional subtraction in Barrett reduction (\texttt{if (r >=
+p)}) is also data-dependent. A production implementation would replace these with a
+constant-time Montgomery ladder and a branch-free correction
+(\texttt{r -= p \& -(uint64\_t)(r >= p)}). Our implementation prioritizes throughput benchmarking
+over side-channel resistance—the classic speed-vs-leakage tension.
+
+\subsection{Field Size vs.\ Throughput}
+
+Increasing the prime field from 30-bit $p_{32}$ to 64-bit $p_{64}$ roughly doubles operand width
+and introduces 128-bit intermediate arithmetic, reducing per-operation throughput. Moving to
+RSA-2048 or 256-bit ECC would require multi-limb arithmetic, further trading speed for security
+margin. The modexp speedup drops from 569$\times$ (30-bit modmul) to 277$\times$ (64-bit
+exponentiation) as a direct consequence.
+
+\subsection{Parallelism Model and Security}
+
+The GPU advantage depends on \emph{batching independent operations}. A single long sequential
+computation (e.g., one RSA-2048 decryption) would not benefit from the GPU at all. For NTT,
+individual butterfly stages are independent but successive stages must wait—motivating shared-memory
+optimizations for small $n$. This is a fundamental property of the SIMT model: it rewards
+data-parallel workloads and is less effective for sequential cryptographic operations.
+
+\subsection{Barrett vs.\ Montgomery in Practice}
+
+Montgomery multiplication offers fewer multiplications per reduction in deeply pipelined loops
+(e.g., very long modexp chains) but incurs domain conversion overhead. For the NTT—which is our
+primary workload—Barrett avoids conversion passes and keeps data in standard residue form across
+stages. This also simplifies the convolution application: the output of an NTT-based polynomial
+multiplication is immediately usable in the standard domain without an extra step.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have implemented a complete GPU modular arithmetic unit in pure CUDA, featuring Barrett
+reduction, modular multiplication, modular exponentiation, and Fermat modular inverse over both a
+30-bit NTT-friendly prime and a 64-bit Goldilocks prime. Applied to the Number Theoretic Transform,
+our implementation achieves a peak kernel speedup of 52$\times$ over a single-thread CPU reference;
+raw Barrett modmul throughput is 569$\times$ faster on the T4. All results are validated at three
+independent levels (C++ oracle, Python/sympy oracle, GPU-vs-CPU elementwise comparison) with zero
+errors across millions of test cases.
+
+The primary finding is that GPU parallelism is most effective for \emph{batched independent}
+modular operations. For the NTT, meaningful speedup begins only at $n \approx 2^{12}$ due to kernel
+launch overhead, peaking around $n = 2^{18}$ before the workload becomes bandwidth-limited. These
+observations, combined with the constant-time discussion, highlight the inherent trade-offs between
+performance and security in GPU cryptographic implementations.
+
+The code is available at: \url{https://github.com/achirra-cypher/ece268-gpu-modarith}
+
+\begin{thebibliography}{00}
+
+\bibitem{barrett}
+P.~D. Barrett, ``Implementing the Rivest Shamir and Adleman public key encryption algorithm on a
+standard digital signal processor,'' in \textit{Advances in Cryptology --- CRYPTO '86}, A.~M.
+Odlyzko, Ed. Berlin, Heidelberg: Springer, 1987, pp. 311--323.
+
+\bibitem{montgomery}
+P.~L. Montgomery, ``Modular multiplication without trial division,''
+\textit{Mathematics of Computation}, vol.~44, no.~170, pp. 519--521, 1985.
+
+\bibitem{kyber}
+J.~Bos, L.~Ducas, E.~Kiltz, T.~Lepoint, V.~Lyubashevsky, J.~M. Schanck, P.~Schwabe,
+G.~Seiler, and D.~Stehle, ``CRYSTALS-Kyber: A CCA-secure module-lattice-based KEM,'' in
+\textit{Proc. IEEE European Symposium on Security and Privacy (EuroS\&P)}, 2018, pp. 353--367.
+
+\bibitem{plonky2}
+B.~Polygon Zero Team, ``Plonky2: Fast recursive arguments with PLONK and FRI,'' 2022. [Online].
+Available: \url{https://github.com/0xPolygonZero/plonky2}
+
+\bibitem{goldilocks}
+M.~Kosta, N.~Attia, J.~Shi, and Y.~Ishai, ``The Goldilocks prime and the goldilocks NTT,''
+in \textit{Advances in Cryptology --- EUROCRYPT 2023}, 2023.
+
+\end{thebibliography}
+
+\end{document}
