@@ -5,3 +5,11 @@ __pycache__/
 results/*.png
 project.zip
 .DS_Store
+~$*.pptx
+report/*.aux
+report/*.log
+slides/*.aux
+slides/*.log
+slides/*.nav
+slides/*.snm
+slides/*.toc
