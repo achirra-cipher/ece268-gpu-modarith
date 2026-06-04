@@ -19,6 +19,7 @@ P64_ROOT = 7
 
 
 def is_prime(n):
+    """Return True if n is prime using sympy when available, else Miller-Rabin."""
     try:
         import sympy
         return bool(sympy.isprime(n))
@@ -46,10 +47,12 @@ def is_prime(n):
 
 
 def barrett_mu(p, k):
+    """Compute Barrett precomputed constant mu = floor(2^k / p)."""
     return (1 << k) // p
 
 
 def barrett_reduce(x, p, mu, k):
+    """Reduce x mod p using Barrett reduction with precomputed mu and shift k."""
     q = (x * mu) >> k
     r = x - q * p
     while r >= p:
@@ -58,6 +61,7 @@ def barrett_reduce(x, p, mu, k):
 
 
 def check_barrett(p, k, trials=200000):
+    """Verify Barrett reduction against Python's built-in modulo over random pairs."""
     mu = barrett_mu(p, k)
     rng = random.Random(1)
     for _ in range(trials):
@@ -69,6 +73,11 @@ def check_barrett(p, k, trials=200000):
 
 
 def ntt(a, inverse, p, root):
+    """Compute forward or inverse NTT of a over Z_p using primitive root.
+
+    Uses Cooley-Tukey iterative butterfly with bit-reversal permutation.
+    len(a) must be a power of two and divide p-1.
+    """
     n = len(a)
     a = a[:]
     j = 0
@@ -102,6 +111,7 @@ def ntt(a, inverse, p, root):
 
 
 def naive_conv(x, y, p):
+    """Compute cyclic convolution of x and y mod p via O(n^2) direct summation."""
     n = len(x)
     z = [0] * n
     for i in range(n):
