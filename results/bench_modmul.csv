@@ -1,0 +1,2 @@
+n,iters,gpu_ms,cpu_ms,gpu_gops,cpu_gops,speedup
+4194304,64,2.0423,1161.0407,131.4355,0.2312,568.49
