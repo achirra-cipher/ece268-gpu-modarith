@@ -17,6 +17,7 @@ RESULTS = os.path.join(os.path.dirname(__file__), "..", "results")
 
 
 def read_csv(name):
+    """Read a CSV from the results directory and return rows as list of dicts."""
     path = os.path.join(RESULTS, name)
     if not os.path.exists(path):
         print(f"  (skip) {name} not found")
@@ -26,6 +27,7 @@ def read_csv(name):
 
 
 def plot_ntt():
+    """Generate latency and speedup plots for NTT benchmarks; write ntt_speedup.png."""
     rows = read_csv("bench_ntt.csv")
     if not rows:
         return
@@ -61,6 +63,7 @@ def plot_ntt():
 
 
 def plot_modmul():
+    """Generate throughput bar chart for modmul benchmarks; write modmul_throughput.png."""
     rows = read_csv("bench_modmul.csv")
     if not rows:
         return
