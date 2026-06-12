@@ -1,8 +1,9 @@
+.venv/
 build/
 *.o
 *.out
 __pycache__/
-results/*.png
+# plots.py writes committed PNGs under results/
 project.zip
 .DS_Store
 ~$*.pptx
