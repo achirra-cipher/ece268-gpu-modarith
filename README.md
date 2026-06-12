@@ -159,13 +159,21 @@ What you get on Colab:
 
 ---
 
-## 8. Next steps
+## 8. Submission status (Group 12)
 
-Project is **complete** as of 2026-05-30. Optional improvements if time permits:
-- Negacyclic NTT (Kyber/Dilithium-style) for a tighter PQC tie-in.
-- Shared-memory NTT kernel for small sizes to close the crossover gap below n=2^11.
-- OpenMP multi-thread CPU baseline for a fairer GPU-vs-CPU comparison.
-- Branch-free / constant-time Barrett correction and Montgomery ladder modexp for the security angle.
+| Deliverable | Location | Status |
+|---|---|---|
+| Source + tests | this repo | done |
+| Colab notebook | `colab/run_on_colab.ipynb` | done |
+| Benchmark CSVs | `results/*.csv` | done |
+| IEEE report | `ECE268_GPU_ModArith_Report_2.pdf` | final PDF edits → Gradescope |
+| 10-min recording | — | use `slides/RECORDING_10MIN.md` + `ECE268_GPU_ModArith_Presentation_2.pptx` |
+| In-class slides | `slides/12_Project_Akhil_Sameera_Abhijit.pptx` | done |
+| Team contributions | `CONTRIBUTIONS.md` | done |
+
+Full checklist: **`SUBMISSION.md`**.
+
+Optional follow-ups: negacyclic NTT, shared-memory small-n kernel, OpenMP CPU baseline, constant-time Barrett.
 
 ---
 
